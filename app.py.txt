@@ -1,0 +1,177 @@
+from flask import Flask, request, Response, jsonify
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import requests
+import json
+import os
+import time
+import logging
+from datetime import datetime
+
+app = Flask(__name__)
+
+# ========================= SUAS CONFIGURAÇÕES =========================
+API_SECRET = "BrainrotScanner2026!xK9#mP$7vQ2@nL8"
+PLACE_ID = "109983668079237"
+BLOCKED_PLACE_ID = "96342491571673"
+
+# Seu IP + localhost
+ALLOWED_IPS = ["143.0.229.43", "127.0.0.1", "::1"]
+
+# Rate Limiting
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["30 per minute"],
+    storage_uri="memory://"
+)
+
+job_queue = []
+detections = []
+recent_jobs = {}
+
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+
+# ========================= FUNÇÕES =========================
+def is_allowed_ip():
+    ip = request.remote_addr
+    return ip in ALLOWED_IPS or ip.startswith("192.168.") or ip.startswith("10.")
+
+def check_secret():
+    secret = request.headers.get("X-API-Secret")
+    if not secret or secret != API_SECRET:
+        logging.warning(f"[BLOCKED] Invalid secret from {request.remote_addr}")
+        return False
+    return True
+
+def fetch_jobs():
+    url = f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
+    try:
+        response = requests.get(url, params={"sortOrder": "Asc", "limit": 100}, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+
+        jobs = []
+        now = time.time()
+
+        if "data" in data:
+            for server in data["data"]:
+                job_id = server.get("id")
+                place_id = str(server.get("placeId", PLACE_ID))
+
+                if place_id == BLOCKED_PLACE_ID:
+                    continue
+                if job_id in recent_jobs and now - recent_jobs[job_id] < 7200:  # 2 horas
+                    continue
+
+                if job_id:
+                    jobs.append({
+                        "jobId": job_id,
+                        "placeId": place_id,
+                        "players": server.get("playing", 0)
+                    })
+        return jobs
+    except Exception as e:
+        logging.error(f"Error fetching jobs: {e}")
+        return []
+
+# ========================= ROTAS =========================
+@app.after_request
+def after_request(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,X-API-Secret'
+    response.headers['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS'
+    return response
+
+@app.route('/get-job', methods=['GET', 'OPTIONS'])
+@limiter.limit("20 per minute")
+def get_job():
+    if request.method == 'OPTIONS':
+        return Response("", 200)
+
+    if not is_allowed_ip():
+        return jsonify({"error": "IP not allowed"}), 403
+    if not check_secret():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    global job_queue
+
+    if len(job_queue) < 10:
+        new_jobs = fetch_jobs()
+        if new_jobs:
+            job_queue.extend(new_jobs)
+            logging.info(f"Queue refilled: {len(job_queue)} jobs")
+
+    if job_queue:
+        job = job_queue.pop(0)
+        recent_jobs[job['jobId']] = time.time()
+
+        return jsonify({
+            "jobId": str(job['jobId']),
+            "placeId": str(job['placeId']),
+            "players": int(job['players'])
+        }), 200
+
+    return jsonify({"error": "No jobs available"}), 404
+
+
+@app.route('/detection', methods=['POST'])
+@limiter.limit("15 per minute")
+def receive_detection():
+    if not is_allowed_ip() or not check_secret():
+        return jsonify({"error": "Access denied"}), 403
+
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No data"}), 400
+
+        logging.info(f"Detection received - Job: {str(data.get('jobId', 'unknown'))[:20]}...")
+        
+        detections.append({
+            **data,
+            "received_at": datetime.utcnow().isoformat()
+        })
+
+        if len(detections) > 50:
+            detections[:] = detections[-50:]
+
+        return jsonify({"status": "received"}), 200
+    except Exception as e:
+        logging.error(f"Detection error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({
+        "status": "running",
+        "queue_size": len(job_queue),
+        "detections_count": len(detections),
+        "place_id": PLACE_ID
+    })
+
+
+@app.route('/test-simple', methods=['GET'])
+def test_simple():
+    return jsonify({
+        "test": "ok",
+        "status": "running",
+        "queue": len(job_queue),
+        "your_ip": request.remote_addr
+    })
+
+
+# ========================= INICIALIZAÇÃO =========================
+if __name__ == '__main__':
+    logging.info("=" * 70)
+    logging.info("🛡️  BRAINROT SCRAPER - RENDER.COM")
+    logging.info(f"IP Autorizado: 143.0.229.43")
+    logging.info("API Secret: Configurado")
+    logging.info("=" * 70)
+
+    job_queue = fetch_jobs()
+    logging.info(f"Started with {len(job_queue)} jobs in queue")
+
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
